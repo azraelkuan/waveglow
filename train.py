@@ -28,15 +28,20 @@ import argparse
 import json
 import os
 import torch
+import numpy as np
 
-#=====START: ADDED FOR DISTRIBUTED======
+# =====START: ADDED FOR DISTRIBUTED======
 from distributed import init_distributed, apply_gradient_allreduce, reduce_tensor
 from torch.utils.data.distributed import DistributedSampler
-#=====END:   ADDED FOR DISTRIBUTED======
+# =====END:   ADDED FOR DISTRIBUTED======
 
 from torch.utils.data import DataLoader
 from glow import WaveGlow, WaveGlowLoss
 from mel2samp import Mel2Samp
+from scipy.io.wavfile import write
+from mel2samp import MAX_WAV_VALUE
+from plot import waveplot
+
 
 def load_checkpoint(checkpoint_path, model, optimizer):
     assert os.path.isfile(checkpoint_path)
@@ -45,13 +50,14 @@ def load_checkpoint(checkpoint_path, model, optimizer):
     optimizer.load_state_dict(checkpoint_dict['optimizer'])
     model_for_loading = checkpoint_dict['model']
     model.load_state_dict(model_for_loading.state_dict())
-    print("Loaded checkpoint '{}' (iteration {})" .format(
-          checkpoint_path, iteration))
+    print("Loaded checkpoint '{}' (iteration {})".format(
+        checkpoint_path, iteration))
     return model, optimizer, iteration
+
 
 def save_checkpoint(model, optimizer, learning_rate, iteration, filepath):
     print("Saving model and optimizer state at iteration {} to {}".format(
-          iteration, filepath))
+        iteration, filepath))
     model_for_saving = WaveGlow(**waveglow_config).cuda()
     model_for_saving.load_state_dict(model.state_dict())
     torch.save({'model': model_for_saving,
@@ -59,22 +65,23 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, filepath):
                 'optimizer': optimizer.state_dict(),
                 'learning_rate': learning_rate}, filepath)
 
+
 def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
           sigma, iters_per_checkpoint, batch_size, seed, checkpoint_path):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    #=====START: ADDED FOR DISTRIBUTED======
+    # =====START: ADDED FOR DISTRIBUTED======
     if num_gpus > 1:
         init_distributed(rank, num_gpus, group_name, **dist_config)
-    #=====END:   ADDED FOR DISTRIBUTED======
+    # =====END:   ADDED FOR DISTRIBUTED======
 
     criterion = WaveGlowLoss(sigma)
     model = WaveGlow(**waveglow_config).cuda()
 
-    #=====START: ADDED FOR DISTRIBUTED======
+    # =====START: ADDED FOR DISTRIBUTED======
     if num_gpus > 1:
         model = apply_gradient_allreduce(model)
-    #=====END:   ADDED FOR DISTRIBUTED======
+    # =====END:   ADDED FOR DISTRIBUTED======
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
@@ -99,6 +106,12 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
     if rank == 0:
         if not os.path.isdir(output_directory):
             os.makedirs(output_directory)
+            checkpoint_dir = os.path.join(output_directory, 'checkpoints')
+            audio_dir = os.path.join(output_directory, 'audios')
+            plot_dir = os.path.join(output_directory, 'plots')
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            os.makedirs(audio_dir, exist_ok=True)
+            os.makedirs(plot_dir, exist_ok=True)
             os.chmod(output_directory, 0o775)
         print("output directory", output_directory)
 
@@ -106,7 +119,6 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
     epoch_offset = max(0, int(iteration / len(train_loader)))
     # ================ MAIN TRAINNIG LOOP! ===================
     for epoch in range(epoch_offset, epochs):
-        print("Epoch: {}".format(epoch))
         for i, batch in enumerate(train_loader):
             model.zero_grad()
 
@@ -123,16 +135,30 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
             loss.backward()
             optimizer.step()
 
-            print("{}:\t{:.9f}".format(iteration, reduced_loss))
+            print("Epoch {:^4d} Iter {:^7d}:{:10.9f}".format(epoch, iteration, reduced_loss), flush=True)
 
-            if (iteration % iters_per_checkpoint == 0):
+            if iteration % iters_per_checkpoint == 0:
                 if rank == 0:
-                    checkpoint_path = "{}/waveglow_{}".format(
-                        output_directory, iteration)
+                    checkpoint_path = "{}/waveglow_{}".format(checkpoint_dir, iteration)
                     save_checkpoint(model, optimizer, learning_rate, iteration,
                                     checkpoint_path)
 
+            if iteration % 1000 == 0:
+                if rank == 0:
+                    predict_audio = model.infer(mel, sigma=sigma)
+                    predict_audio = predict_audio[0].cpu().numpy().reshape((-1, ))
+                    real_audio = audio[0].cpu().numpy().reshape((-1, )) * MAX_WAV_VALUE
+
+                    predict_audio_path = os.path.join(audio_dir, "step_{}_predict.wav".format(iteration))
+                    real_audio_path = os.path.join(audio_dir, "step_{}_real.wav".format(iteration))
+                    write(predict_audio_path, data_config['sampling_rate'], predict_audio)
+                    write(real_audio_path, data_config['sampling_rate'], real_audio)
+
+                    plot_path = os.path.join(plot_dir, 'step_{}.png'.format(iteration))
+                    waveplot(plot_path, real_audio, predict_audio, data_config['sampling_rate'])
+
             iteration += 1
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
